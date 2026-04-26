@@ -54,9 +54,11 @@ import logging
 import os
 import sys
 import json
+import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib import error as urllib_error
+from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 import customtkinter as ctk
@@ -434,17 +436,59 @@ class DropZoneWidget(ctk.CTkFrame):
     def _setup_dnd(self) -> None:
         """Register DnD handlers if tkinterdnd2 is available."""
         if not globals().get("_HAS_DND"):
-            logger.debug("tkinterdnd2 not available — DnD disabled, click-to-browse still works.")
+            logger.debug("tkinterdnd2 not available - DnD disabled, click-to-browse still works.")
             return
 
         try:
-            self.drop_target_register(DND_FILES)
-            self.dnd_bind("<<DropEnter>>", self._on_dnd_enter)
-            self.dnd_bind("<<DropLeave>>", self._on_dnd_leave)
-            self.dnd_bind("<<Drop>>",      self._on_dnd_drop)
-            logger.debug("Drag-and-drop registered successfully.")
+            registered = 0
+            for widget in self._iter_drop_widgets():
+                if self._register_dnd_widget(widget):
+                    registered += 1
+
+            if registered == 0:
+                raise RuntimeError("No drop-capable widgets were registered.")
+
+            logger.debug("Drag-and-drop registered on %d widget(s).", registered)
         except Exception as e:
             logger.error(f"DnD registration failed: {e}")
+
+    def _iter_drop_widgets(self):
+        """Yield drop zone widgets (self + descendants) to register as drop targets."""
+        stack = [self]
+        while stack:
+            widget = stack.pop()
+            yield widget
+            try:
+                stack.extend(widget.winfo_children())
+            except Exception:
+                continue
+
+    def _register_dnd_widget(self, widget) -> bool:
+        """
+        Register one widget as a DnD target.
+
+        CustomTkinter widgets do not always expose tkinterdnd2 mixin methods,
+        so we fall back to direct tkdnd registration via Tcl when needed.
+        """
+        try:
+            if hasattr(widget, "drop_target_register"):
+                widget.drop_target_register(DND_FILES)
+            else:
+                widget.tk.call("tkdnd::drop_target", "register", widget._w, DND_FILES)
+
+            self._bind_dnd_event(widget, "<<DropEnter>>", self._on_dnd_enter)
+            self._bind_dnd_event(widget, "<<DropLeave>>", self._on_dnd_leave)
+            self._bind_dnd_event(widget, "<<Drop>>", self._on_dnd_drop)
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _bind_dnd_event(widget, event_name: str, handler) -> None:
+        if hasattr(widget, "dnd_bind"):
+            widget.dnd_bind(event_name, handler)
+        else:
+            widget.bind(event_name, handler, add="+")
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -479,51 +523,63 @@ class DropZoneWidget(ctk.CTkFrame):
         if paths:
             self.on_files_added(paths)
 
-    @staticmethod
-    def _parse_dnd_paths(raw: str) -> List[Path]:
+    @classmethod
+    def _parse_dnd_paths(cls, raw: str) -> List[Path]:
         """
-        Parse the raw DnD path string from tkinterdnd2.
+        Parse the raw DnD payload into local file paths.
 
-        tkinterdnd2 returns paths as a Tcl list:
-          - Plain paths are space-separated.
-          - Paths with spaces are wrapped in {curly braces}.
+        tkinterdnd2 commonly sends a Tcl list where paths containing spaces
+        are wrapped in braces. Some shells/toolkits can also pass file:// URIs.
         """
+        if not raw:
+            return []
+
+        try:
+            tokens = list(tk.Tcl().splitlist(raw))
+        except tk.TclError:
+            tokens = cls._split_brace_wrapped_paths(raw)
+
         paths: List[Path] = []
-        # Split on spaces that are NOT inside curly braces
-        i = 0
-        tokens: List[str] = []
-        current = ""
-        depth = 0
-        while i < len(raw):
-            c = raw[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    tokens.append(current.strip())
-                    current = ""
-                    i += 1
-                    continue
-            elif c == " " and depth == 0:
-                if current.strip():
-                    tokens.append(current.strip())
-                current = ""
-                i += 1
-                continue
-            if depth > 0:
-                current += c
-            elif c != "{":
-                current += c
-            i += 1
-        if current.strip():
-            tokens.append(current.strip())
-
         for token in tokens:
-            p = Path(token)
-            if p.exists() and p.is_file():
-                paths.append(p)
+            normalized = cls._normalize_dnd_token(token)
+            if not normalized:
+                continue
+            candidate = Path(normalized)
+            if candidate.exists() and candidate.is_file():
+                paths.append(candidate)
         return paths
+
+    @staticmethod
+    def _normalize_dnd_token(token: str) -> str:
+        text = (token or "").strip().strip("\"")
+        if not text:
+            return ""
+
+        if text.startswith("{") and text.endswith("}") and len(text) >= 2:
+            text = text[1:-1].strip()
+
+        if text.lower().startswith("file://"):
+            parsed = urllib_parse.urlparse(text)
+            decoded_path = urllib_parse.unquote(parsed.path or "")
+            if parsed.netloc:
+                decoded_path = f"//{parsed.netloc}{decoded_path}"
+            if len(decoded_path) >= 3 and decoded_path[0] == "/" and decoded_path[2] == ":":
+                decoded_path = decoded_path[1:]
+            text = decoded_path
+
+        return text.strip()
+
+    @staticmethod
+    def _split_brace_wrapped_paths(raw: str) -> List[str]:
+        # Capture either {braced paths with spaces} or plain non-space tokens.
+        matches = re.findall(r"\{([^}]*)\}|(\S+)", raw)
+        tokens: List[str] = []
+        for braced, plain in matches:
+            token = braced or plain
+            token = token.strip()
+            if token:
+                tokens.append(token)
+        return tokens
 
     @staticmethod
     def _open_file_dialog() -> List[Path]:
