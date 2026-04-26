@@ -1,0 +1,9 @@
+customtkinter
+tkinterdnd2
+requests
+pymupdf
+python-docx
+python-pptx
+pandas
+openpyxl
+genanki
